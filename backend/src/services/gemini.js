@@ -1,10 +1,17 @@
-import { GoogleGenAI } from '@google/genai';
+import { Ollama } from 'ollama';
 import { config } from '../config.js';
 import { AppError } from '../middleware/errors.js';
 import { ReportSchema, JSON_TEMPLATE } from './schema.js';
 import { groundReport } from './ground.js';
 
-const ai = config.geminiKey ? new GoogleGenAI({ apiKey: config.geminiKey }) : null;
+const ollama = config.geminiKey
+  ? new Ollama({
+      host: config.ollamaUrl,
+      headers: {
+        Authorization: 'Bearer ' + config.geminiKey,
+      },
+    })
+  : null;
 
 const SYSTEM = `You are a clinical documentation reviewer. You read SYNTHETIC clinical documents and produce a structured review for a human reviewer.
 
@@ -32,7 +39,12 @@ function mapAiError(err) {
   if (err instanceof AppError) return err;
   if (err.code === 'AI_TIMEOUT')
     return new AppError(504, 'AI_TIMEOUT', 'The AI service took too long to respond. Please try again.');
-  const status = err.status || err.code;
+  // Ollama connection refused / server not running
+  if (err.code === 'ECONNREFUSED' || err.cause?.code === 'ECONNREFUSED')
+    return new AppError(502, 'AI_SERVICE_ERROR', 'Could not reach the Ollama server. Is it running?');
+  const status = err.status_code || err.status || err.code;
+  if (status === 404)
+    return new AppError(500, 'AI_MODEL_NOT_FOUND', `Model "${config.geminiModel}" is not available on the Ollama server.`);
   if (status === 429)
     return new AppError(503, 'AI_RATE_LIMITED', 'The AI service is busy right now. Wait a minute and try again.');
   if (status === 400)
@@ -42,18 +54,20 @@ function mapAiError(err) {
   return new AppError(502, 'AI_SERVICE_ERROR', 'The AI service failed. Please try again.');
 }
 
-async function callModel(parts) {
-  if (!ai) throw new AppError(500, 'AI_NOT_CONFIGURED', 'GEMINI_API_KEY is not set on the server.');
+async function callModel(messages) {
+  if (!ollama) throw new AppError(500, 'AI_NOT_CONFIGURED', 'OLLAMA_API_KEY is not set on the server.');
   try {
     const res = await withTimeout(
-      ai.models.generateContent({
+      ollama.chat({
         model: config.geminiModel,
-        contents: [{ role: 'user', parts }],
-        config: { systemInstruction: SYSTEM, responseMimeType: 'application/json', temperature: 0 },
+        messages,
+        format: 'json',
+        options: { temperature: 0 },
+        stream: false,
       }),
       config.aiTimeoutMs
     );
-    return res.text ?? '';
+    return res.message?.content ?? '';
   } catch (err) {
     throw mapAiError(err);
   }
@@ -64,23 +78,40 @@ function parseJson(raw) {
   return JSON.parse(cleaned);
 }
 
-export async function analyzeDocument(extracted) {
-  const parts = [];
-  if (extracted.sourceText) {
-    parts.push({ text: `DOCUMENT TEXT:\n"""\n${extracted.sourceText}\n"""` });
-  } else {
-    parts.push({ text: 'The clinical document is attached. It may be scanned, photographed or handwritten. Read it carefully.' });
-    parts.push({ inlineData: extracted.media });
-  }
-  parts.push({ text: 'Return the JSON report now.' });
+// extracted.media is expected as { mimeType, data } where data is base64 (matches the
+// shape previously used for Gemini's inlineData). Ollama's chat() takes raw base64
+// strings (no data: URI prefix) in the message's `images` array.
+function buildMessages(extracted, extraNote) {
+  const messages = [{ role: 'system', content: SYSTEM }];
 
+  if (extracted.sourceText) {
+    messages.push({ role: 'user', content: `DOCUMENT TEXT:\n"""\n${extracted.sourceText}\n"""` });
+  } else {
+    messages.push({
+      role: 'user',
+      content: 'The clinical document is attached. It may be scanned, photographed or handwritten. Read it carefully.',
+      images: [extracted.media.data],
+    });
+  }
+
+  if (extraNote) {
+    messages.push({ role: 'user', content: extraNote });
+  } else {
+    messages.push({ role: 'user', content: 'Return the JSON report now.' });
+  }
+
+  return messages;
+}
+
+export async function analyzeDocument(extracted) {
   let lastProblem = '';
   for (let attempt = 1; attempt <= 2; attempt++) {
-    const attemptParts = lastProblem
-      ? [...parts, { text: `Your previous reply was invalid (${lastProblem.slice(0, 400)}). Return ONLY valid JSON that matches the template.` }]
-      : parts;
+    const note = lastProblem
+      ? `Your previous reply was invalid (${lastProblem.slice(0, 400)}). Return ONLY valid JSON that matches the template.`
+      : undefined;
+    const messages = buildMessages(extracted, note);
 
-    const raw = await callModel(attemptParts);
+    const raw = await callModel(messages);
     try {
       const report = ReportSchema.parse(parseJson(raw));
       return groundReport(report, extracted.sourceText);
